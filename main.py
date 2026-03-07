@@ -124,12 +124,25 @@ def handle_text_message(event):
                 role, response = get_role_and_content(response)
                 msg = TextSendMessage(text=response)
             memory.append(user_id, role, response)
-    except ValueError:
-        msg = TextSendMessage(text='Token 無效，請重新註冊，格式為 /註冊 sk-xxxxx')
-    except KeyError:
-        msg = TextSendMessage(text='請先註冊 Token，格式為 /註冊 sk-xxxxx')
-    except Exception as e:
-        memory.remove(user_id)
+                else:
+                # 暴力修復：直接指定模型與金鑰，確保不讀取壞掉的資料庫或變數
+                is_successful, response, error_message = user_model.chat_completions(
+                    memory.get(user_id), 
+                    "gpt-3.5-turbo"
+                )
+                if not is_successful:
+                    # 如果還是失敗，嘗試用環境變數強制補救
+                    is_successful, response, error_message = user_model.chat_completions(
+                        memory.get(user_id), 
+                        os.getenv('OPENAI_MODEL_ENGINE') or "gpt-3.5-turbo"
+                    )
+                
+                if not is_successful:
+                    raise Exception(error_message)
+                
+                role, response = get_role_and_content(response)
+                msg = TextSendMessage(text=response)
+
         if str(e).startswith('Incorrect API key provided'):
             msg = TextSendMessage(text='OpenAI API Token 有誤，請重新註冊。')
         elif str(e).startswith('That model is currently overloaded with other requests.'):
