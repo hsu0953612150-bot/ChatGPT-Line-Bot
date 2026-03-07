@@ -124,12 +124,17 @@ def handle_text_message(event):
                 role, response = get_role_and_content(response)
                 msg = TextSendMessage(text=response)
             memory.append(user_id, role, response)
-                else:
-                # 暴力修復：直接指定模型與金鑰，確保不讀取壞掉的資料庫或變數
+                            else:
                 is_successful, response, error_message = user_model.chat_completions(
                     memory.get(user_id), 
                     "gpt-3.5-turbo"
                 )
+                if not is_successful:
+                    raise Exception(error_message)
+                
+                role, response = get_role_and_content(response)
+                msg = TextSendMessage(text=response)
+
                 if not is_successful:
                     # 如果還是失敗，嘗試用環境變數強制補救
                     is_successful, response, error_message = user_model.chat_completions(
