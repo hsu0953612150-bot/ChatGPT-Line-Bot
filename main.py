@@ -2,8 +2,8 @@ from dotenv import load_dotenv
 from flask import Flask, request, abort
 from linebot import (LineBotApi, WebhookHandler)
 from linebot.exceptions import (InvalidSignatureError)
-from linebot.models import (MessageEvent, TextMessage, TextSendMessage)
-import os, requests
+from linebot.models import (MessageEvent, TextMessage, TextSendMessage, ImageMessage)
+import os, requests, base64
 from src.models import OpenAIModel
 from src.memory import Memory
 from src.utils import get_role_and_content
@@ -13,24 +13,10 @@ app = Flask(__name__)
 line_bot_api = LineBotApi(os.getenv('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.getenv('LINE_CHANNEL_SECRET'))
 
-# 從環境變數讀取，不再寫死在代碼中以防失效
+# 從環境變數讀取
 OPENAI_KEY = os.getenv('OPENAI_API_KEY')
-TAVILY_KEY = os.getenv('TAVILY_API_KEY')
-
-# 智能體核心設定
-system_msg = "你是一個先進的 AI 智能體。你記得使用者住在淡水。回答搜尋結果時必須附上網頁連結。"
-memory = Memory(system_message=system_msg, memory_message_count=15)
+memory = Memory(system_message="你是一個全能智能體，具備視覺分析與聯網搜尋能力。你記得使用者住在淡水。", memory_message_count=10)
 model = OpenAIModel(api_key=OPENAI_KEY)
-
-def google_search(query):
-    if not TAVILY_KEY: return "搜尋功能未配置。"
-    url = "https://api.tavily.com/search"
-    payload = {"api_key": TAVILY_KEY, "query": query, "search_depth": "smart"}
-    try:
-        response = requests.post(url, json=payload).json()
-        results = [f"標題: {r['title']}\n網址: {r['url']}\n內容: {r['content']}" for r in response['results'][:3]]
-        return "\n\n".join(results)
-    except: return "搜尋引擎連線失敗。"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -42,36 +28,50 @@ def callback():
         abort(400)
     return 'OK'
 
+# --- 處理文字訊息 ---
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text_message(event):
     user_id = event.source.user_id
     text = event.message.text.strip()
+    try:
+        memory.append(user_id, 'user', text)
+        # 升級至 gpt-4o-mini，速度快且支援視覺
+        is_successful, response, error_message = model.chat_completions(memory.get(user_id), "gpt-4o-mini")
+        if is_successful:
+            role, res_text = get_role_and_content(response)
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=res_text))
+            memory.append(user_id, role, res_text)
+    except Exception as e:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="大G 思考中，請稍候..."))
+
+# --- 處理圖片訊息 (視覺之眼) ---
+@handler.add(MessageEvent, message=ImageMessage)
+def handle_image_message(event):
+    user_id = event.source.user_id
+    message_content = line_bot_api.get_message_content(event.message.id)
+    
+    # 將圖片轉為 Base64 格式傳給 OpenAI
+    base64_image = base64.b64encode(message_content.content).decode('utf-8')
     
     try:
-        if text == "/清除":
-            memory.remove(user_id)
-            msg = TextSendMessage(text="記憶已清空")
-        else:
-            # 判斷搜尋意圖
-            if any(k in text for k in ['找', '查', '搜尋', '最新', '天氣']):
-                search_data = google_search(text)
-                text = f"參考資料：\n{search_data}\n\n根據以上資料回答並附上連結：{text}"
-
-            memory.append(user_id, 'user', text)
-            # 使用 GPT-3.5-Turbo 以節省額度並保持速度
-            is_successful, response, error_message = model.chat_completions(memory.get(user_id), "gpt-3.5-turbo")
-            
-            if is_successful:
-                role, res_text = get_role_and_content(response)
-                msg = TextSendMessage(text=res_text)
-                memory.append(user_id, role, res_text)
-            else:
-                msg = TextSendMessage(text=f"OpenAI 回報錯誤，請檢查 Render 的 API Key 設定。")
-                
+        headers = {"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"}
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "請問這張圖片裡面有什麼？請詳細描述。"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                    ]
+                }
+            ]
+        }
+        response = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload).json()
+        description = response['choices'][0]['message']['content']
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=description))
     except Exception as e:
-        msg = TextSendMessage(text="系統繁忙，請稍後再試。")
-        
-    line_bot_api.reply_message(event.reply_token, msg)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="我看到了圖片，但目前解析有點問題..."))
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=8080)
