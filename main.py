@@ -13,27 +13,24 @@ app = Flask(__name__)
 line_bot_api = LineBotApi(os.getenv('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.getenv('LINE_CHANNEL_SECRET'))
 
-# --- 硬核設定：直接鎖定你的 API Key ---
-# 請將下方的 sk-xxxx 換成你真正的 OpenAI Key
-MY_OPENAI_KEY = "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"
+# 從環境變數讀取，不再寫死在代碼中以防失效
+OPENAI_KEY = os.getenv('OPENAI_API_KEY')
+TAVILY_KEY = os.getenv('TAVILY_API_KEY')
 
-# 智能體設定
-system_msg = "你是一個先進的 AI 智能體。你記得使用者住在淡水，且對 2026 年市場規劃有深入了解。回答搜尋結果時必須附上連結。"
-memory = Memory(system_message=system_msg, memory_message_count=10)
-
-# 初始化模型
-global_model = OpenAIModel(api_key=MY_OPENAI_KEY)
+# 智能體核心設定
+system_msg = "你是一個先進的 AI 智能體。你記得使用者住在淡水。回答搜尋結果時必須附上網頁連結。"
+memory = Memory(system_message=system_msg, memory_message_count=15)
+model = OpenAIModel(api_key=OPENAI_KEY)
 
 def google_search(query):
-    tavily_key = os.getenv('TAVILY_API_KEY')
-    if not tavily_key: return "搜尋功能未配置。"
+    if not TAVILY_KEY: return "搜尋功能未配置。"
     url = "https://api.tavily.com/search"
-    payload = {"api_key": tavily_key, "query": query, "search_depth": "smart"}
+    payload = {"api_key": TAVILY_KEY, "query": query, "search_depth": "smart"}
     try:
         response = requests.post(url, json=payload).json()
         results = [f"標題: {r['title']}\n網址: {r['url']}\n內容: {r['content']}" for r in response['results'][:3]]
         return "\n\n".join(results)
-    except: return "無法連接搜尋引擎。"
+    except: return "搜尋引擎連線失敗。"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -51,34 +48,30 @@ def handle_text_message(event):
     text = event.message.text.strip()
     
     try:
-        if text.startswith('/清除'):
+        if text == "/清除":
             memory.remove(user_id)
-            msg = TextSendMessage(text='記憶已重置。')
+            msg = TextSendMessage(text="記憶已清空")
         else:
-            # 偵測搜尋意圖
-            if any(k in text for k in ['找', '查', '搜尋', '最新', '推薦']):
+            # 判斷搜尋意圖
+            if any(k in text for k in ['找', '查', '搜尋', '最新', '天氣']):
                 search_data = google_search(text)
-                text = f"參考資料：\n{search_data}\n\n根據以上資料回答問題：{text}"
+                text = f"參考資料：\n{search_data}\n\n根據以上資料回答並附上連結：{text}"
 
             memory.append(user_id, 'user', text)
-            # 使用我們鎖定的 global_model
-            is_successful, response, error_message = global_model.chat_completions(memory.get(user_id), "gpt-3.5-turbo")
+            # 使用 GPT-3.5-Turbo 以節省額度並保持速度
+            is_successful, response, error_message = model.chat_completions(memory.get(user_id), "gpt-3.5-turbo")
             
             if is_successful:
-                role, response_text = get_role_and_content(response)
-                msg = TextSendMessage(text=response_text)
-                memory.append(user_id, role, response_text)
+                role, res_text = get_role_and_content(response)
+                msg = TextSendMessage(text=res_text)
+                memory.append(user_id, role, res_text)
             else:
-                msg = TextSendMessage(text=f"連線失敗: {error_message}")
+                msg = TextSendMessage(text=f"OpenAI 回報錯誤，請檢查 Render 的 API Key 設定。")
                 
     except Exception as e:
-        msg = TextSendMessage(text='大G 正在重新連線，請稍後再試。')
+        msg = TextSendMessage(text="系統繁忙，請稍後再試。")
         
     line_bot_api.reply_message(event.reply_token, msg)
-
-@app.route("/", methods=['GET'])
-def home():
-    return 'Hello World'
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=8080)
