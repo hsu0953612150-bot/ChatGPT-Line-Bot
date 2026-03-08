@@ -6,31 +6,34 @@ from linebot.models import (MessageEvent, TextMessage, TextSendMessage)
 import os, requests
 from src.models import OpenAIModel
 from src.memory import Memory
-from src.storage import Storage, FileStorage
 from src.utils import get_role_and_content
 
 load_dotenv('.env')
 app = Flask(__name__)
 line_bot_api = LineBotApi(os.getenv('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.getenv('LINE_CHANNEL_SECRET'))
-storage = Storage(FileStorage('db.json'))
 
-# 智能體設定：賦予搜尋權限
-system_msg = "你是一個具備聯網能力的 AI 智能體。若使用者詢問最新資訊、天氣或需要查證的事實，你會參考搜尋結果並給出準確回答。"
+# --- 硬核設定：直接鎖定你的 API Key ---
+# 請將下方的 sk-xxxx 換成你真正的 OpenAI Key
+MY_OPENAI_KEY = "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"
+
+# 智能體設定
+system_msg = "你是一個先進的 AI 智能體。你記得使用者住在淡水，且對 2026 年市場規劃有深入了解。回答搜尋結果時必須附上連結。"
 memory = Memory(system_message=system_msg, memory_message_count=10)
-model_management = {}
 
-# --- 搜尋功能函數 ---
+# 初始化模型
+global_model = OpenAIModel(api_key=MY_OPENAI_KEY)
+
 def google_search(query):
-    api_key = os.getenv('TAVILY_API_KEY')
-    if not api_key: return "搜尋功能尚未配置 Key。"
+    tavily_key = os.getenv('TAVILY_API_KEY')
+    if not tavily_key: return "搜尋功能未配置。"
     url = "https://api.tavily.com/search"
-    payload = {"api_key": api_key, "query": query, "search_depth": "smart"}
+    payload = {"api_key": tavily_key, "query": query, "search_depth": "smart"}
     try:
         response = requests.post(url, json=payload).json()
-        results = [f"標題: {r['title']}\n內容: {r['content']}" for r in response['results'][:3]]
+        results = [f"標題: {r['title']}\n網址: {r['url']}\n內容: {r['content']}" for r in response['results'][:3]]
         return "\n\n".join(results)
-    except: return "暫時無法連接搜尋引擎。"
+    except: return "無法連接搜尋引擎。"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -48,32 +51,34 @@ def handle_text_message(event):
     text = event.message.text.strip()
     
     try:
-        if text.startswith('/註冊'):
-            api_key = text[3:].strip()
-            model_management[user_id] = OpenAIModel(api_key=api_key)
-            storage.save({user_id: api_key})
-            msg = TextSendMessage(text='註冊成功！搜尋之手已準備就緒。')
-        elif text.startswith('/清除'):
+        if text.startswith('/清除'):
             memory.remove(user_id)
-            msg = TextSendMessage(text='記憶已清空。')
+            msg = TextSendMessage(text='記憶已重置。')
         else:
-            if user_id not in model_management:
-                msg = TextSendMessage(text='請先註冊 API Key')
-            else:
-                # 偵測是否需要搜尋
-                if any(k in text for k in ['找', '查', '搜尋', '最新', '天氣', '新聞', '2026']):
-                    search_result = google_search(text)
-                    text = f"根據以下搜尋結果回答問題：\n{search_result}\n\n使用者問題：{text}"
+            # 偵測搜尋意圖
+            if any(k in text for k in ['找', '查', '搜尋', '最新', '推薦']):
+                search_data = google_search(text)
+                text = f"參考資料：\n{search_data}\n\n根據以上資料回答問題：{text}"
 
-                memory.append(user_id, 'user', text)
-                is_successful, response, error_message = model_management[user_id].chat_completions(memory.get(user_id), "gpt-3.5-turbo")
+            memory.append(user_id, 'user', text)
+            # 使用我們鎖定的 global_model
+            is_successful, response, error_message = global_model.chat_completions(memory.get(user_id), "gpt-3.5-turbo")
+            
+            if is_successful:
                 role, response_text = get_role_and_content(response)
                 msg = TextSendMessage(text=response_text)
                 memory.append(user_id, role, response_text)
+            else:
+                msg = TextSendMessage(text=f"連線失敗: {error_message}")
+                
     except Exception as e:
-        msg = TextSendMessage(text='大G 正在處理數據中...')
+        msg = TextSendMessage(text='大G 正在重新連線，請稍後再試。')
         
     line_bot_api.reply_message(event.reply_token, msg)
+
+@app.route("/", methods=['GET'])
+def home():
+    return 'Hello World'
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=8080)
