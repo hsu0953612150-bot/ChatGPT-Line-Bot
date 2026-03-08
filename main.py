@@ -4,7 +4,6 @@ from linebot import (LineBotApi, WebhookHandler)
 from linebot.exceptions import (InvalidSignatureError)
 from linebot.models import (MessageEvent, TextMessage, TextSendMessage, ImageSendMessage)
 import os
-import uuid
 from src.models import OpenAIModel
 from src.memory import Memory
 from src.logger import logger
@@ -16,7 +15,13 @@ app = Flask(__name__)
 line_bot_api = LineBotApi(os.getenv('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.getenv('LINE_CHANNEL_SECRET'))
 storage = Storage(FileStorage('db.json'))
-memory = Memory(system_message=os.getenv('SYSTEM_MESSAGE'), memory_message_count=2)
+
+# 這裡做了修正：如果環境變數是空的，就給它一個預設值 'You are a helpful assistant.'
+system_msg = os.getenv('SYSTEM_MESSAGE')
+if not system_msg:
+    system_msg = 'You are a helpful assistant.'
+    
+memory = Memory(system_message=system_msg, memory_message_count=2)
 model_management = {}
 
 @app.route("/callback", methods=['POST'])
@@ -40,7 +45,7 @@ def handle_text_message(event):
             model = OpenAIModel(api_key=api_key)
             model_management[user_id] = model
             storage.save({user_id: api_key})
-            msg = TextSendMessage(text='註冊成功')
+            msg = TextSendMessage(text='註冊成功，請開始對話')
         elif text.startswith('/清除'):
             memory.remove(user_id)
             msg = TextSendMessage(text='歷史訊息清除成功')
@@ -50,6 +55,7 @@ def handle_text_message(event):
             else:
                 user_model = model_management[user_id]
                 memory.append(user_id, 'user', text)
+                # 強制指定模型，確保不會因為環境變數遺失而失敗
                 is_successful, response, error_message = user_model.chat_completions(memory.get(user_id), "gpt-3.5-turbo")
                 if not is_successful:
                     raise Exception(error_message)
@@ -57,7 +63,8 @@ def handle_text_message(event):
                 msg = TextSendMessage(text=response)
                 memory.append(user_id, role, response)
     except Exception as e:
-        msg = TextSendMessage(text='執行出錯，請重新輸入 /清除 後再試一次')
+        logger.error(f'Error: {str(e)}')
+        msg = TextSendMessage(text=f'大G 休息中，請先輸入 /清除 後再試試看')
     line_bot_api.reply_message(event.reply_token, msg)
 
 @app.route("/", methods=['GET'])
@@ -70,5 +77,5 @@ if __name__ == "__main__":
         for u_id in data.keys():
             model_management[u_id] = OpenAIModel(api_key=data[u_id])
     except:
-        print("尚未有資料庫檔案，跳過載入")
+        pass
     app.run(host='0.0.0.0', port=8080)
