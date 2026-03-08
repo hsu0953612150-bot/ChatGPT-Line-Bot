@@ -13,41 +13,44 @@ app = Flask(__name__)
 line_bot_api = LineBotApi(os.getenv('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.getenv('LINE_CHANNEL_SECRET'))
 
-# 從 Render 環境變數讀取
+# 從環境變數讀取
 OPENAI_KEY = os.getenv('OPENAI_API_KEY')
 TAVILY_KEY = os.getenv('TAVILY_API_KEY')
 
-# 核心指令：要求 AI 絕對不可虛構網址
-SYSTEM_PROMPT = """你是一個專業的自主智能體秘書。
-你記得使用者住在淡水。當使用者詢問最新活動或連結時：
-1. 必須使用提供的搜尋數據，絕對禁止自行編造網址。
-2. 優先提供來自台灣 (.tw) 的官方或新聞連結。
-3. 如果搜尋不到有效連結，請誠實告知，不要提供無效的網址。"""
+# 核心指令：要求 AI 必須使用搜尋到的真實 URL
+SYSTEM_PROMPT = """你是一個 OpenClaw 風格的專業助手。
+你記得使用者住在淡水。當使用者要求搜尋或圖片時：
+1. 必須先從提供的搜尋結果中提取網址。
+2. 禁止編造網址，若連結打不開請告知原因。
+3. 優先選擇以 .jpg 或 .png 結尾的圖片連結。"""
 
 memory = Memory(system_message=SYSTEM_PROMPT, memory_message_count=10)
 model = OpenAIModel(api_key=OPENAI_KEY)
 
-# 強化版聯網搜尋函數
-def google_search(query):
-    if not TAVILY_KEY: return "搜尋功能未配置。"
+# 強化搜尋與圖片抓取函數
+def tavily_agent_search(query):
+    if not TAVILY_KEY: return "搜尋 API 未配置。"
     url = "https://api.tavily.com/search"
-    # 加入 site:.tw 限制，確保連結對台灣使用者有效
     payload = {
         "api_key": TAVILY_KEY, 
-        "query": f"{query} site:.tw", 
+        "query": query, 
         "search_depth": "smart",
-        "max_results": 5
+        "include_images": True, # 強制抓取圖片連結
+        "max_results": 3
     }
     try:
         response = requests.post(url, json=payload, timeout=12).json()
-        results = []
-        for r in response.get('results', []):
-            # 格式化輸出：標題 + 完整網址
-            results.append(f"🔗 {r['title']}\n{r['url']}")
         
-        return "\n\n".join(results) if results else "找不到相關的即時有效連結。"
-    except Exception:
-        return "搜尋引擎連線超時，請稍後再試。"
+        # 提取文字結果
+        text_results = [f"🔗 {r['title']}\n網址: {r['url']}" for r in response.get('results', [])]
+        
+        # 提取圖片結果
+        images = [f"🖼️ 圖片連結: {img}" for img in response.get('images', [])]
+        
+        final_info = "\n\n".join(text_results + images)
+        return final_info if final_info else "未找到相關有效連結。"
+    except:
+        return "連網功能暫時不穩定。"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -67,18 +70,14 @@ def handle_text_message(event):
     try:
         if text == "/清除":
             memory.remove(user_id)
-            msg = TextSendMessage(text="記憶已清空")
+            msg = TextSendMessage(text="記憶已清空。")
         else:
             # 偵測搜尋意圖
-            search_keywords = ['搜尋', '找', '查', '連結', '活動', '優惠', '最新']
-            if any(k in text for k in search_keywords):
-                # 如果關鍵字包含淡水，則直接搜尋；否則自動補上淡水
-                query = text if "淡水" in text else f"淡水 {text}"
-                search_data = google_search(query)
-                text = f"【即時搜尋結果】：\n{search_data}\n\n【請根據以上資料回答】：{text}"
+            if any(k in text for k in ['搜尋', '查', '找', '活動', '照片', '圖片']):
+                search_data = tavily_agent_search(text)
+                text = f"【最新搜尋數據】：\n{search_data}\n\n【請依據數據回答】：{text}"
 
             memory.append(user_id, 'user', text)
-            # 使用支援視覺與長邏輯的 gpt-4o-mini
             is_successful, response, error_message = model.chat_completions(memory.get(user_id), "gpt-4o-mini")
             
             if is_successful:
@@ -86,10 +85,9 @@ def handle_text_message(event):
                 msg = TextSendMessage(text=res_text)
                 memory.append(user_id, role, res_text)
             else:
-                msg = TextSendMessage(text="OpenAI 連線不穩定，請檢查 API Key 餘額或設定。")
-                
+                msg = TextSendMessage(text="OpenAI 回應失敗，請檢查 Key。")
     except Exception:
-        msg = TextSendMessage(text="系統重整中，請輸入 /清除 後再試。")
+        msg = TextSendMessage(text="系統繁忙，請稍後再試。")
         
     line_bot_api.reply_message(event.reply_token, msg)
 
