@@ -57,7 +57,7 @@ def handle_text_message(event):
                 msg = TextSendMessage(text=response)
                 memory.append(user_id, role, response)
     except Exception as e:
-        msg = TextSendMessage(text=str(e))
+        msg = TextSendMessage(text='執行出錯，請重新輸入 /清除 後再試一次')
     line_bot_api.reply_message(event.reply_token, msg)
 
 @app.route("/", methods=['GET'])
@@ -65,7 +65,10 @@ def home():
     return 'Hello World'
 
 if __name__ == "__main__":
-    data = storage.load()
-    for u_id in data.keys():
-        model_management[u_id] = OpenAIModel(api_key=data[u_id])
+    try:
+        data = storage.load()
+        for u_id in data.keys():
+            model_management[u_id] = OpenAIModel(api_key=data[u_id])
+    except:
+        print("尚未有資料庫檔案，跳過載入")
     app.run(host='0.0.0.0', port=8080)
