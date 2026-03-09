@@ -13,37 +13,39 @@ from dotenv import load_dotenv
 load_dotenv()
 app = Flask(__name__)
 
-# 配置 LINE 與 API 金鑰
+# --- 基礎配置 ---
 line_bot_api = LineBotApi(os.getenv('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.getenv('LINE_CHANNEL_SECRET'))
 TAVILY_KEY = os.getenv('TAVILY_API_KEY')
 OPENAI_KEY = os.getenv('OPENAI_API_KEY')
 
-# --- 1. 長期記憶系統 (Google Sheets) ---
+# --- 1. 雲端大腦 (Google Sheets 長期記憶) ---
 def get_sheet():
     try:
+        # 讀取環境變數中的 JSON 憑證
         scope = ['https://www.googleapis.com/auth/spreadsheets']
         creds_json = json.loads(os.getenv('GOOGLE_CREDENTIALS'))
         creds = Credentials.from_service_account_info(creds_json, scopes=scope)
         client = gspread.authorize(creds)
+        # 開啟指定的試算表
         return client.open_by_key(os.getenv('GOOGLE_SHEET_KEY')).sheet1
-    except:
+    except Exception as e:
+        print(f"Sheet Error: {e}")
         return None
 
-def save_memory(user_key, value):
+def update_memory(key_name, value):
     sheet = get_sheet()
     if sheet:
-        cell = sheet.find(user_key)
+        cell = sheet.find(key_name)
         if cell:
             sheet.update_cell(cell.row, 2, value)
         else:
-            sheet.append_row([user_key, value])
+            sheet.append_row([key_name, value])
 
-# --- 2. 視覺與影片分析 (GPT-4o Vision) ---
-def analyze_media(content_bytes, mode="image"):
-    if not OPENAI_KEY: return "⚠️ 未設定 OpenAI Key。"
-    base64_data = base64.b64encode(content_bytes).decode('utf-8')
-    prompt = "你是住淡水的大G。請詳細分析內容，如果是鞋子請識別型號；如果是單據請讀取金額。" if mode == "image" else "請根據影片截圖分析這是什麼曲目或場景。"
+# --- 2. 視覺與媒體分析 (GPT-4o Vision) ---
+def analyze_media(content_bytes):
+    if not OPENAI_KEY: return "⚠️ 大G 尚未連接 OpenAI 視覺大腦。"
+    base64_image = base64.b64encode(content_bytes).decode('utf-8')
     
     headers = {"Authorization": f"Bearer {OPENAI_KEY}"}
     payload = {
@@ -51,37 +53,40 @@ def analyze_media(content_bytes, mode="image"):
         "messages": [{
             "role": "user",
             "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_data}"}}
+                {"type": "text", "text": "你是住淡水的大G。請分析圖片內容，如果是商品請找型號，如果是收據請讀取金額，並以親切口吻回覆。"},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
             ]
         }]
     }
     try:
-        res = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload).json()
+        res = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=30).json()
         return res['choices'][0]['message']['content']
     except:
-        return "❌ 媒體解析失敗。"
+        return "❌ 視覺解析出了一點問題，請稍後再試。"
 
-# --- 3. 即時聯網監控搜尋 ---
-def search_and_monitor(query):
-    if not TAVILY_KEY: return "⚠️ 未設定 Tavily Key。"
+# --- 3. 即時聯網監控 ---
+def web_monitor_search(query):
+    if not TAVILY_KEY: return "⚠️ 聯網監控功能尚未開啟。"
     url = "https://api.tavily.com/search"
-    # 自動補強關鍵字，避免出現 example 連結
+    # 加入特定語法確保搜尋結果在地化
     payload = {
         "api_key": TAVILY_KEY,
-        "query": f"台灣 淡水 {query} 最新實時資訊",
+        "query": f"台灣 淡水 {query} 最新消息",
         "search_depth": "advanced",
         "max_results": 3
     }
     try:
         response = requests.post(url, json=payload, timeout=15).json()
-        results = [f"🔗 {r['title']}\n{r['url']}" for r in response.get('results', [])]
-        if not results: return "❌ 目前網路上沒有更新的即時資訊。"
-        return "【大G 實時監控報告】：\n\n" + "\n\n".join(results)
+        results = [f"📌 {r['title']}\n{r['url']}" for r in response.get('results', [])]
+        return "【大G 即時監控報告】：\n\n" + "\n\n".join(results) if results else "❌ 暫時查無最新動態。"
     except:
-        return "❌ 網路監控連線異常。"
+        return "❌ 網路搜尋異常。"
 
-# --- LINE 訊息處理器 ---
+# --- 4. LINE 路由處理 ---
+
+@app.route("/", methods=['GET'])
+def home():
+    return "大G 全能監控系統運作中", 200
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -93,33 +98,41 @@ def callback():
         abort(400)
     return 'OK'
 
+# 處理圖片訊息
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image(event):
-    msg_content = line_bot_api.get_message_content(event.message.id)
-    result = analyze_media(msg_content.content)
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=result))
+    message_content = line_bot_api.get_message_content(event.message.id)
+    reply_text = analyze_media(message_content.content)
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
 
+# 處理文字訊息
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text(event):
     user_text = event.message.text.strip()
     
     if user_text == "/清除":
-        save_memory("last_address", "") # 清除 Google Sheets 中的紀錄
-        reply = "記憶已在雲端清空，大G 重新待命。"
-    elif "搜尋" in user_text or "監控" in user_text:
-        reply = search_and_monitor(user_text)
+        update_memory("address", "")
+        reply = "雲端記憶已重置，大G 重新待命。"
+    elif any(k in user_text for k in ["搜尋", "監控", "找"]):
+        reply = web_monitor_search(user_text)
     elif "住" in user_text:
-        save_memory("last_address", user_text) # 將地址存入長期記憶
-        reply = f"收到！大G 已將您的居住地記在雲端資料庫：\n{user_text}"
+        update_memory("address", user_text) # 紀錄地址到試算表
+        reply = f"🏠 收到！大G 已記下您的位置：\n{user_text}"
     else:
-        # 一般對話交給 AI
+        # 使用 AI 進行日常對話
         headers = {"Authorization": f"Bearer {OPENAI_KEY}"}
         data = {
             "model": "gpt-4o",
-            "messages": [{"role": "system", "content": "你是住淡水的大G，語氣專業且幽默。"}, {"role": "user", "content": user_text}]
+            "messages": [
+                {"role": "system", "content": "你是住淡水的大G。你會主動參考使用者的居住地來提供建議。"},
+                {"role": "user", "content": user_text}
+            ]
         }
-        res = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=data).json()
-        reply = res['choices'][0]['message']['content']
+        try:
+            res = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=data).json()
+            reply = res['choices'][0]['message']['content']
+        except:
+            reply = "大G 正在喝阿給湯，請稍後再跟我說話喔！"
 
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
