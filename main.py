@@ -1,53 +1,51 @@
 import os
 import json
-import time
-import gspread
+import datetime
 from flask import Flask, request, abort
-from google.oauth2.service_account import Credentials
-from linebot import (LineBotApi, WebhookHandler)
-from linebot.exceptions import (InvalidSignatureError)
-from linebot.models import (MessageEvent, TextMessage, TextSendMessage)
-from dotenv import load_dotenv
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, TextMessage, TextSendMessage, ImageMessage
+import google.generativeai as genai
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
-# 載入環境變數
-load_dotenv()
 app = Flask(__name__)
 
-# --- 1. 基礎配置 (請確保 Render 的 Environment Variables 已設定) ---
-line_bot_api = LineBotApi(os.getenv('LINE_CHANNEL_ACCESS_TOKEN'))
-handler = WebhookHandler(os.getenv('LINE_CHANNEL_SECRET'))
+# --- 1. 環境變數設定 ---
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
+LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
+GOOGLE_API_KEY = os.environ.get('GOOGLE_API_KEY')
+GOOGLE_SHEET_KEY = os.environ.get('GOOGLE_SHEET_KEY')
+GOOGLE_CREDENTIALS_JSON = os.environ.get('GOOGLE_CREDENTIALS')
 
-# --- 2. 核心功能：寫入手機代理指令到 Google Sheets ---
-def trigger_phone_proxy(action_code):
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
+# --- 2. Gemini AI 設定 (包含搜尋與記憶) ---
+genai.configure(api_key=GOOGLE_API_KEY)
+# 使用 gemini-1.5-flash 兼顧速度與圖片處理
+model = genai.GenerativeModel('gemini-1.5-flash')
+# 建立對話記憶體
+chat_sessions = {}
+
+# --- 3. Google Sheets 寫入功能 (手機遙控) ---
+def write_to_sheet(action_name):
     try:
-        # 設定 Google Sheets 存取權限
-        scope = ['https://www.googleapis.com/auth/spreadsheets']
-        creds_json = json.loads(os.getenv('GOOGLE_CREDENTIALS'))
-        creds = Credentials.from_service_account_info(creds_json, scopes=scope)
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         client = gspread.authorize(creds)
-        
-        # 開啟名為 Commands 的工作表
-        sheet = client.open_by_key(os.getenv('GOOGLE_SHEET_KEY')).worksheet("Commands")
-        
-        # 依照你的表格標題：status(A1), action(B1), timestamp(C1) 寫入資料
-        # 寫入：待處理(pending), 指令動作, 目前時間戳記
-        sheet.append_row(["pending", action_code, str(int(time.time()))])
+        # 確認分頁名稱為 Commands
+        sheet = client.open_by_key(GOOGLE_SHEET_KEY).worksheet("Commands")
+        sheet.append_row(["pending", action_name, str(datetime.datetime.now())])
         return True
     except Exception as e:
-        print(f"Google Sheets 寫入失敗: {e}")
+        print(f"Sheet Error: {e}")
         return False
-
-# --- 3. 路由設定 (修正日誌中的 404 錯誤) ---
-
-@app.route("/", methods=['GET'])
-def home():
-    # 建立根目錄路由，讓 Render 的健康檢查 (HEAD/GET /) 能回傳 200 而非 404
-    return "大G 全能代理系統：運作中", 200
 
 @app.route("/callback", methods=['POST'])
 def callback():
-    # 處理來自 LINE 的 Webhook 訊息
-    signature = request.headers.get('X-Line-Signature')
+    signature = request.headers['X-Line-Signature']
     body = request.get_data(as_text=True)
     try:
         handler.handle(body, signature)
@@ -55,35 +53,51 @@ def callback():
         abort(400)
     return 'OK'
 
-# --- 4. 訊息處理邏輯 ---
-
+# --- 4. 處理文字訊息 (搜尋、記憶、遙控指令) ---
 @handler.add(MessageEvent, message=TextMessage)
-def handle_text(event):
-    user_text = event.message.text.strip()
-    
-    # 識別「幫我」開頭的代理指令
-    if "幫我" in user_text:
-        if any(k in user_text for k in ["音樂", "歌曲", "識別"]):
-            # 觸發手機端的音樂識別或播放動作
-            if trigger_phone_proxy("play_music"):
-                reply = "🎵 指令已送達雲端！大G 正在透過手機代理為您處理音樂任務。"
-            else:
-                reply = "❌ 寫入指令失敗，請檢查 Google Sheets 權限與設定。"
-        elif "導航" in user_text or "地圖" in user_text:
-            # 觸發手機端的導航動作
-            if trigger_phone_proxy("open_navigation"):
-                reply = "🗺️ 沒問題！手機代理正在為您規劃回淡水的路線。"
-            else:
-                reply = "❌ 雲端同步失敗。"
-        else:
-            reply = "大G 收到指令，但我還在學習如何讓手機執行這項特定任務喔！"
-    else:
-        # 一般 AI 對話回應
-        reply = "我是大G，今天有什麼想讓手機幫你完成的事嗎？"
+def handle_message(event):
+    user_id = event.source.user_id
+    user_text = event.message.text
 
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+    # [手機遙控模式]
+    if "識別音樂" in user_text or "辨識音樂" in user_text:
+        if write_to_sheet("play_music"):
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🎵 指令已送達雲端！手機正在啟動音樂識別，請稍候。"))
+        else:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 雲端寫入失敗，請檢查 Google Sheets 權限。"))
+        return
+
+    # [AI 搜尋與記憶模式]
+    try:
+        # 如果是新用戶，開啟新的對話 Session 實現記憶功能
+        if user_id not in chat_sessions:
+            chat_sessions[user_id] = model.start_chat(history=[])
+        
+        chat = chat_sessions[user_id]
+        response = chat.send_message(user_text)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=response.text))
+    except Exception as e:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"AI 暫時無法回應，請稍後再試。原因: {e}"))
+
+# --- 5. 處理圖片訊息 (恢復看圖功能) ---
+@handler.add(MessageEvent, message=ImageMessage)
+def handle_image(event):
+    try:
+        # 取得 LINE 傳來的圖片內容
+        message_content = line_bot_api.get_message_content(event.message.id)
+        image_data = b""
+        for chunk in message_content.iter_content():
+            image_data += chunk
+        
+        # 視覺分析
+        contents = [
+            {"mime_type": "image/jpeg", "data": image_data},
+            "這張圖片裡有什麼？請詳細說明。"
+        ]
+        response = model.generate_content(contents)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=response.text))
+    except Exception as e:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 圖片識別發生錯誤：{e}"))
 
 if __name__ == "__main__":
-    # Render 預設使用 port 10000
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=10000)
