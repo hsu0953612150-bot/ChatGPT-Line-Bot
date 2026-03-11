@@ -4,6 +4,7 @@ python-dotenv==0.21.1
 requests==2.28.1
 gspread
 google-auth
+oauth2client
 openai
 tavily-python
 google-generativeai
