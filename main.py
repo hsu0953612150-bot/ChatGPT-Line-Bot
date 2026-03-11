@@ -79,7 +79,7 @@ def handle_text(event):
             reply = "大G 收到指令，但我還在學習如何讓手機執行這項特定任務喔！"
     else:
         # 一般 AI 對話回應
-        reply = "我是住淡水的大G，今天有什麼想讓手機幫你完成的事嗎？"
+        reply = "我是大G，今天有什麼想讓手機幫你完成的事嗎？"
 
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
