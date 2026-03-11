@@ -1,88 +1,135 @@
 import os
 import json
 import datetime
+import base64
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.models import MessageEvent, TextMessage, TextSendMessage, ImageMessage
 from openai import OpenAI
-from tavily import TavilyClient  # 新增 Tavily
+from tavily import TavilyClient
+import google.generativeai as genai
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 app = Flask(__name__)
 
-# --- 環境變數讀取 ---
+# --- 1. 環境變數讀取 ---
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
-TAVILY_API_KEY = os.environ.get('TAVILY_API_KEY') # 確保 Render 有這個變數
+TAVILY_API_KEY = os.environ.get('TAVILY_API_KEY')
+GOOGLE_API_KEY = os.environ.get('GOOGLE_API_KEY')  # 用於圖片分析
 GOOGLE_SHEET_KEY = os.environ.get('GOOGLE_SHEET_KEY')
 GOOGLE_CREDENTIALS_JSON = os.environ.get('GOOGLE_CREDENTIALS')
 
+# --- 2. 初始化客戶端 ---
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
 
-# 簡易記憶
+# 初始化 Gemini 用於圖片分析 (OpenAI 3.5 不支援直接圖片輸入)
+genai.configure(api_key=GOOGLE_API_KEY)
+vision_model = genai.GenerativeModel('gemini-1.5-flash')
+
+# 簡易對話記憶體
 chat_histories = {}
 
+# --- 3. 功能函式 ---
+
+# 解決 Render 404 報錯的心跳路由
+@app.route("/", methods=['GET'])
+def index():
+    return "大G 全功能系統：GPT + Tavily + Vision + Sheets 運行中！", 200
+
+# 寫入 Google Sheets
 def write_to_sheet(action_name):
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        # 確保 GOOGLE_CREDENTIALS 是完整的 JSON 字串
+        creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_info, scope)
         gc = gspread.authorize(creds)
         sheet = gc.open_by_key(GOOGLE_SHEET_KEY).worksheet("Commands")
         sheet.append_row(["pending", action_name, str(datetime.datetime.now())])
         return True
-    except: return False
+    except Exception as e:
+        print(f"Sheet Error: {e}")
+        return False
 
+# --- 4. LINE Callback 處理 ---
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers['X-Line-Signature']
     body = request.get_data(as_text=True)
-    try: handler.handle(body, signature)
-    except InvalidSignatureError: abort(400)
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400)
     return 'OK'
 
+# --- 5. 處理文字訊息 (搜尋、記憶、指令) ---
 @handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
+def handle_text(event):
     user_id = event.source.user_id
     user_text = event.message.text
 
-    # 1. 識別音樂指令
+    # [手機遙控模式]
     if "識別音樂" in user_text:
         if write_to_sheet("play_music"):
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🎵 正在為您識別音樂..."))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🎵 收到！正在透過雲端幫您辨識音樂。"))
         else:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 雲端寫入失敗，請檢查 JSON 格式"))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 寫入失敗，請確認 JSON 格式與試算表權限。"))
         return
 
-    # 2. Tavily 搜尋
+    # [Tavily 即時搜尋]
     try:
-        search_result = tavily_client.search(query=user_text, max_results=3)
-        context = "\n".join([r['content'] for r in search_result['results']])
+        search_result = tavily_client.search(query=user_text, search_depth="advanced", max_results=3)
+        context = "\n".join([f"來源: {r['content']}" for r in search_result['results']])
     except:
-        context = "無法取得即時資訊。"
+        context = "暫時無法取得聯網資訊。"
 
-    # 3. GPT 回答 (帶入搜尋結果)
-    if user_id not in chat_histories: chat_histories[user_id] = []
+    # [GPT-3.5 記憶對話]
+    if user_id not in chat_histories:
+        chat_histories[user_id] = []
     
     messages = [
-        {"role": "system", "content": f"你是大G，住在淡水。請參考以下最新資訊回答：\n{context}"},
-        *chat_histories[user_id][-5:],
+        {"role": "system", "content": f"你是住在淡水的大G。參考資訊：\n{context}"},
+        *chat_histories[user_id][-4:], # 帶入最近 4 則對話記憶
         {"role": "user", "content": user_text}
     ]
     
-    response = openai_client.chat.completions.create(model="gpt-3.5-turbo", messages=messages)
-    reply = response.choices[0].message.content
-    
-    chat_histories[user_id].append({"role": "user", "content": user_text})
-    chat_histories[user_id].append({"role": "assistant", "content": reply})
-    
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+    try:
+        completion = openai_client.chat.completions.create(model="gpt-3.5-turbo", messages=messages)
+        reply = completion.choices[0].message.content
+        
+        # 儲存紀錄
+        chat_histories[user_id].append({"role": "user", "content": user_text})
+        chat_histories[user_id].append({"role": "assistant", "content": reply})
+        
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+    except Exception as e:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"抱歉，大G 腦袋打結了：{e}"))
+
+# --- 6. 處理圖片訊息 (恢復看圖分析) ---
+@handler.add(MessageEvent, message=ImageMessage)
+def handle_image(event):
+    try:
+        message_content = line_bot_api.get_message_content(event.message.id)
+        image_data = b""
+        for chunk in message_content.iter_content():
+            image_data += chunk
+        
+        # 使用 Gemini Vision 進行分析
+        contents = [
+            {"mime_type": "image/jpeg", "data": image_data},
+            "這張圖片裡有什麼？請詳細說明。"
+        ]
+        response = vision_model.generate_content(contents)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=response.text))
+    except Exception as e:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"圖片識別發生錯誤：{e}"))
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=10000)
