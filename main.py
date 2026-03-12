@@ -1,7 +1,6 @@
 import os
 import json
 import datetime
-import requests
 from flask import Flask, request, abort
 
 # LINE SDK
@@ -9,7 +8,7 @@ from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage, ImageMessage
 
-# AI & Search SDK
+# AI & Search
 from openai import OpenAI
 from tavily import TavilyClient
 import google.generativeai as genai
@@ -20,7 +19,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 app = Flask(__name__)
 
-# --- 1. 環境變數 (請確保在 Render 設定中已填妥) ---
+# --- 1. 環境變數 ---
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
@@ -35,33 +34,44 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
 
-# 初始化 Gemini (解決 404 關鍵：明確指定版本與配置)
+# 短期記憶存儲 (UserID: [messages])
+session_storage = {}
+
 if GOOGLE_API_KEY:
     genai.configure(api_key=GOOGLE_API_KEY)
-    # 使用穩定模型名稱，不需要加 'models/' 前綴
     vision_model = genai.GenerativeModel('gemini-1.5-flash')
 
-@app.route("/", methods=['GET'])
-def index():
-    return "大G 穩定版服務運行中", 200
+# --- 3. 記憶功能函式 ---
 
-def write_to_sheet(action_name):
+def get_sheet_connection(sheet_name):
+    """建立 Google Sheet 連接"""
+    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON.replace('\n', '').strip())
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    gc = gspread.authorize(creds)
+    return gc.open_by_key(GOOGLE_SHEET_KEY).worksheet(sheet_name)
+
+def fetch_long_term_memory(user_id):
+    """從 UserMemory 分頁獲取長期記憶"""
     try:
-        if not GOOGLE_CREDENTIALS_JSON:
-            return False
-        
-        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        # 處理 JSON 格式中可能的換行問題
-        creds_info = json.loads(GOOGLE_CREDENTIALS_JSON, strict=False)
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_info, scope)
-        gc = gspread.authorize(creds)
-        
-        sheet = gc.open_by_key(GOOGLE_SHEET_KEY).worksheet("Commands")
-        sheet.append_row(["pending", action_name, str(datetime.datetime.now())])
-        return True
+        wks = get_sheet_connection("UserMemory")
+        records = wks.get_all_records()
+        user_notes = [f"{r['Key']}: {r['Value']}" for r in records if str(r['UserID']) == str(user_id)]
+        return "\n".join(user_notes) if user_notes else "尚無個人資料。"
     except Exception as e:
-        print(f"Sheet Error: {e}")
+        print(f"Memory Fetch Error: {e}")
+        return "記憶讀取失敗。"
+
+def save_long_term_memory(user_id, key, value):
+    """存入長期記憶"""
+    try:
+        wks = get_sheet_connection("UserMemory")
+        wks.append_row([str(user_id), key, value, str(datetime.datetime.now())])
+        return True
+    except:
         return False
+
+# --- 4. 路由與事件處理 ---
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -73,74 +83,60 @@ def callback():
         abort(400)
     return 'OK'
 
-# --- 3. 處理文字訊息 ---
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text(event):
+    user_id = event.source.user_id
     user_text = event.message.text
-    
-    # 指令識別
-    if "識別音樂" in user_text:
-        if write_to_sheet("play_music"):
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🎵 指令已寫入雲端！"))
-        else:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 雲端寫入失敗，請檢查 API 權限。"))
-        return
 
-    # 聯網搜尋 (Tavily)
-    search_context = ""
-    if TAVILY_API_KEY:
+    # [主動記憶功能]
+    if user_text.startswith("記住"):
         try:
-            search_res = tavily_client.search(query=user_text, max_results=2)
-            search_context = "\n".join([r['content'] for r in search_res['results']])
+            # 格式：記住 地址是淡水
+            content = user_text.replace("記住", "").strip()
+            key, value = content.split("是")
+            if save_long_term_memory(user_id, key.strip(), value.strip()):
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 記住了！{key} 是 {value}"))
+            return
         except:
-            search_context = "（目前無法獲取即時網路資訊）"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 格式錯誤。請用：記住 [項目]是[內容]"))
+            return
 
-    # OpenAI 回答
+    # [提取長期記憶]
+    long_term_memory = fetch_long_term_memory(user_id)
+
+    # [聯網搜尋優化]
+    search_context = ""
+    search_query = user_text
+    # 如果對話中提到「天氣」或「我家」且記憶中有地址，自動補齊地點
+    if ("天氣" in user_text or "家" in user_text) and "淡水" in long_term_memory:
+        search_query = f"淡水 {user_text}"
+    
     try:
-        response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": f"你是大G。參考資料：\n{search_context}\n請用繁體中文回答。"},
-                {"role": "user", "content": user_text}
-            ]
-        )
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=response.choices[0].message.content))
-    except Exception as e:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"大G 遇到了一點問題：{str(e)}"))
+        search_res = tavily_client.search(query=search_query, max_results=2)
+        search_context = "\n".join([r['content'] for r in search_res['results']])
+    except:
+        search_context = "暫時無法聯網。"
 
-# --- 4. 處理圖片訊息 (Gemini Vision) ---
-@handler.add(MessageEvent, message=ImageMessage)
-def handle_image(event):
-    if not GOOGLE_API_KEY:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 尚未配置 GOOGLE_API_KEY"))
-        return
-        
+    # [短期記憶處理]
+    if user_id not in session_storage:
+        session_storage[user_id] = []
+    
+    # 組合 Prompt
+    system_prompt = (
+        f"你是大G。目前時間：{datetime.datetime.now()}\n"
+        f"【使用者的長期記憶】：\n{long_term_memory}\n\n"
+        f"【最新網路資訊】：\n{search_context}\n"
+        f"請參考上述資訊並結合對話脈絡回覆，保持親切。"
+    )
+
+    messages = [{"role": "system", "content": system_prompt}]
+    # 加上最近 5 則歷史訊息
+    messages.extend(session_storage[user_id][-5:])
+    messages.append({"role": "user", "content": user_text})
+
     try:
-        # 下載圖片
-        message_content = line_bot_api.get_message_content(event.message.id)
-        image_bytes = b"".join(message_content.iter_content())
+        response = openai_client.chat.completions.create(model="gpt-3.5-turbo", messages=messages)
+        reply_content = response.choices[0].message.content
         
-        # 準備圖片格式
-        image_parts = [
-            {
-                "mime_type": "image/jpeg",
-                "data": image_bytes
-            }
-        ]
-        
-        # 呼叫 Gemini 1.5 Flash
-        response = vision_model.generate_content([
-            "請詳細用繁體中文描述這張圖片的內容。", 
-            image_parts[0]
-        ])
-        
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=response.text))
-        
-    except Exception as e:
-        print(f"Gemini Error: {e}")
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"識別錯誤：系統暫時無法分析圖片。"))
-
-if __name__ == "__main__":
-    # 使用 Render 要求的 Port
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+        # 儲存到短期記憶
+        session_storage[user
