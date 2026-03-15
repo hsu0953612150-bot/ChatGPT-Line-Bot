@@ -3,22 +3,24 @@ import json
 import datetime
 from flask import Flask, request, abort
 
-# 導入 SDK
+# LINE SDK
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage, ImageMessage
+
+# AI & Search SDK
 from openai import OpenAI
 from tavily import TavilyClient
-from google import genai  # 使用最新版 SDK 解決 404 問題
+from google import genai  # 最新版 SDK
 from google.genai import types
 
-# 導入 Google Sheets 相關
+# Google Sheets 相關
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 app = Flask(__name__)
 
-# --- 1. 環境變數對接 (根據你提供的變數名稱) ---
+# --- 1. 環境變數對接 ---
 LINE_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 OPENAI_KEY = os.environ.get('OPENAI_API_KEY')
@@ -33,17 +35,20 @@ line_bot_api = LineBotApi(LINE_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 openai_client = OpenAI(api_key=OPENAI_KEY)
 tavily_client = TavilyClient(api_key=TAVILY_KEY)
-# 初始化新版 Gemini 客戶端
-gemini_client = genai.Client(api_key=GOOGLE_KEY) if GOOGLE_KEY else None
 
-# 短期記憶緩存 (UserID: [messages])
+# 修正重點：強制指定 api_version='v1' 以避開 404 錯誤
+gemini_client = None
+if GOOGLE_KEY:
+    gemini_client = genai.Client(api_key=GOOGLE_KEY, http_options={'api_version': 'v1'})
+
+# 短期記憶快取 (UserID: [messages])
 session_storage = {}
 
 # --- 3. Google Sheets 記憶功能 ---
 def get_wks(sheet_name):
     """建立與 Google Sheets 的連線"""
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-    # 處理環境變數中的 JSON 格式
+    # 處理環境變數中的 JSON 格式換行問題
     creds_dict = json.loads(GOOGLE_CREDS_JSON.replace('\n', '\\n').strip(), strict=False)
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     return gspread.authorize(creds).open_by_key(SHEET_KEY).worksheet(sheet_name)
@@ -57,7 +62,7 @@ def fetch_memory(user_id):
         return "\n".join(notes) if notes else "無個人偏好紀錄。"
     except Exception as e:
         print(f"Memory Fetch Error: {e}")
-        return "記憶系統維護中。"
+        return "記憶系統讀取失敗。"
 
 def save_memory(user_id, key, value):
     """存入長期記憶"""
@@ -100,7 +105,8 @@ def handle_text(event):
     # [功能：提取長期記憶並優化搜尋]
     long_term_mem = fetch_memory(user_id)
     search_query = user_text
-    # 智慧補強：若提到天氣且記憶中有地址，自動結合
+    
+    # 根據記憶自動補強搜尋 (解決截圖中問天氣卻回覆丹佛的問題)
     if "天氣" in user_text and "淡水" in long_term_mem:
         search_query = f"淡水 {user_text}"
 
@@ -112,19 +118,20 @@ def handle_text(event):
     except:
         web_info = "無法取得即時網路資訊。"
 
-    # [功能：管理短期記憶與生成回覆]
+    # [功能：管理對話上下文]
     if user_id not in session_storage:
         session_storage[user_id] = []
     
+    # 修改後的 System Prompt，強制 AI 承認記憶
     system_prompt = (
         f"你是大G。目前時間：{datetime.datetime.now()}\n"
         f"【使用者的長期記憶】：\n{long_term_mem}\n\n"
         f"【網路參考資訊】：\n{web_info}\n"
-        f"請參考上述資訊並結合對話脈絡回覆，保持親切。"
+        f"請參考上述資訊回答。如果記憶中有相關資訊，請表現出你記得對方的樣子，不要說你沒有記憶。"
     )
 
     messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(session_storage[user_id][-5:]) # 加入最近 5 輪對話
+    messages.extend(session_storage[user_id][-5:]) 
     messages.append({"role": "user", "content": user_text})
 
     try:
@@ -134,12 +141,12 @@ def handle_text(event):
         # 更新短期記憶
         session_storage[user_id].append({"role": "user", "content": user_text})
         session_storage[user_id].append({"role": "assistant", "content": reply_content})
-        session_storage[user_id] = session_storage[user_id][-10:] # 只留 10 則
+        session_storage[user_id] = session_storage[user_id][-10:] 
         
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_content))
     except Exception as e:
         print(f"OpenAI Error: {e}")
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="大G 正在處理中，請稍後。"))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="大G 處理中，請稍候。"))
 
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image(event):
@@ -147,11 +154,10 @@ def handle_image(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ Gemini API 未配置"))
         return
     try:
-        # 下載圖片內容
         message_content = line_bot_api.get_message_content(event.message.id)
         image_bytes = b"".join(message_content.iter_content())
         
-        # 使用新版 SDK 核心語法，徹底解決 404 問題
+        # 使用新版 SDK 並確保 v1 路徑
         response = gemini_client.models.generate_content(
             model="gemini-1.5-flash",
             contents=[
